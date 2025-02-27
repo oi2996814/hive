@@ -20,20 +20,22 @@ documentation].
 
 Ethereum Foundation operates a public instance of Hive to check for consensus
 compatibility, peer-to-peer networking spec compliance, and user API support for most
-Ethereum client implementations. You can find the latest test results at
-<https://hivetests.ethdevops.io/>.
+Ethereum client implementations.
+
+You can find the latest test results at <https://hivetests.ethdevops.io/>
+and <https://hivetests2.ethdevops.io/>.
 
 ## Overview of available simulators
 
 This is an overview of some of the simulators which are currently implemented and running
 continuously on the production hive instance:
 
-- `devp2p/eth`, `devp2p/discv4`: These simulators run the 'eth' peer-to-peer protocol
-  tests and Discovery v4 protocol tests. The test suites themselves are maintained in the
-  go-ethereum repository. In their hive adaptation, the simulator launches the client with
-  a known test chain, obtains its peer-to-peer endpoint (the `enode://` URL) and sends
-  protocol messages to it. The client's responses are analyzed by the test suite to ensure
-  that they conform to the respective protocol specification.
+- `devp2p`: This simulator runs 'eth', 'snap' and 'discv4' peer-to-peer protocol tests.
+  The test suites themselves are maintained in the go-ethereum repository. In their hive
+  adaptation, the simulator launches the client with a known test chain, obtains its
+  peer-to-peer endpoint (the `enode://` URL) and sends protocol messages to it. The
+  client's responses are analyzed by the test suite to ensure that they conform to the
+  respective protocol specification.
 
 - `ethereum/sync`: This simulator attempts to synchronize the blockchain among all
   clients. For each enabled client implementation, it creates one instance of the client
@@ -55,14 +57,21 @@ continuously on the production hive instance:
   enables the GraphQL API endpoint. It then performs certain queries and compares their
   output to known good outputs.
 
+- `ethereum/engine`: The engine API simulator verifies specification compliance of the
+  [Engine API] implementation of execution clients. The test suite 'pretends' to be a
+  consensus client and has checks for many scenarios that could occur during progression
+  of a PoS chain.
+
+[Engine API]: https://github.com/ethereum/execution-apis/tree/main/src/engine
+
 ## How it works
 
-This section explains how a single simulation run works.
+This section explains what happens during a simulation run.
 
 For a single run, the user provides the name of the simulator to run, and a set of client
 names to run against. For example:
 
-    ./hive --sim ethereum/sync --client go-ethereum,besu,openethereum
+    ./hive --sim ethereum/sync --client go-ethereum,besu,nethermind
 
 Hive first builds simulator and client images using docker. It expects a Dockerfile in the
 `./simulators/ethereum/sync` directory as well as a Dockerfile for each client (in

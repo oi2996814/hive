@@ -62,6 +62,8 @@ def ethash_engine:
           (env.HIVE_FORK_CONSTANTINOPLE|to_hex//""): 2000000,
           (env.HIVE_FORK_MUIR_GLACIER|to_hex//""): 4000000,
           (env.HIVE_FORK_LONDON|to_hex//""): 700000,
+          (env.HIVE_FORK_ARROW_GLACIER|to_hex//""): 1000000,
+          (env.HIVE_FORK_GRAY_GLACIER|to_hex//""): 700000,
         }
       }
     }
@@ -95,6 +97,7 @@ def clique_engine:
     "eip155Transition": env.HIVE_FORK_SPURIOUS|to_hex,
     "maxCodeSizeTransition": env.HIVE_FORK_SPURIOUS|to_hex,
     "maxCodeSize": 24576,
+    "maximumExtraDataSize": "0x400",
 
     # Byzantium
     "eip140Transition": env.HIVE_FORK_BYZANTIUM|to_hex,
@@ -108,8 +111,8 @@ def clique_engine:
     "eip1052Transition": env.HIVE_FORK_CONSTANTINOPLE|to_hex,
 
     # Petersburg
-    "eip1283Transition": (if env.HIVE_FORK_ISTANBUL then "0x0" else env.HIVE_FORK_CONSTANTINOPLE|to_hex end),
-    "eip1283DisableTransition": (if env.HIVE_FORK_ISTANBUL then "0x0" else env.HIVE_FORK_PETERSBURG|to_hex end),
+    "eip1283Transition": (if env.HIVE_FORK_ISTANBUL|to_hex == "0x0" then "0x0" else env.HIVE_FORK_CONSTANTINOPLE|to_hex end),
+    "eip1283DisableTransition": (if env.HIVE_FORK_ISTANBUL|to_hex == "0x0" then "0x0" else env.HIVE_FORK_PETERSBURG|to_hex end),
 
     # Istanbul
     "eip152Transition": env.HIVE_FORK_ISTANBUL|to_hex,
@@ -132,9 +135,48 @@ def clique_engine:
     "eip3541Transition": env.HIVE_FORK_LONDON|to_hex,
     "eip3198Transition": env.HIVE_FORK_LONDON|to_hex,
 
+    # Merge
+    "MergeForkIdTransition": env.HIVE_MERGE_BLOCK_ID|to_hex,
+
+    # Shanghai
+    "eip3651TransitionTimestamp": env.HIVE_SHANGHAI_TIMESTAMP|to_hex,
+    "eip3855TransitionTimestamp": env.HIVE_SHANGHAI_TIMESTAMP|to_hex,
+    "eip3860TransitionTimestamp": env.HIVE_SHANGHAI_TIMESTAMP|to_hex,
+    "eip4895TransitionTimestamp": env.HIVE_SHANGHAI_TIMESTAMP|to_hex,
+
+    # Cancun
+    "eip4844TransitionTimestamp": env.HIVE_CANCUN_TIMESTAMP|to_hex,
+    "eip4788TransitionTimestamp": env.HIVE_CANCUN_TIMESTAMP|to_hex,
+    "eip1153TransitionTimestamp": env.HIVE_CANCUN_TIMESTAMP|to_hex,
+    "eip5656TransitionTimestamp": env.HIVE_CANCUN_TIMESTAMP|to_hex,
+    "eip6780TransitionTimestamp": env.HIVE_CANCUN_TIMESTAMP|to_hex,
+
+    # Prague
+    "eip2537TransitionTimestamp": env.HIVE_PRAGUE_TIMESTAMP|to_hex,
+    "eip2935TransitionTimestamp": env.HIVE_PRAGUE_TIMESTAMP|to_hex,
+    "eip6110TransitionTimestamp": env.HIVE_PRAGUE_TIMESTAMP|to_hex,
+    "eip7002TransitionTimestamp": env.HIVE_PRAGUE_TIMESTAMP|to_hex,
+    "eip7251TransitionTimestamp": env.HIVE_PRAGUE_TIMESTAMP|to_hex,
+    "eip7685TransitionTimestamp": env.HIVE_PRAGUE_TIMESTAMP|to_hex,
+    "eip7702TransitionTimestamp": env.HIVE_PRAGUE_TIMESTAMP|to_hex,
+    "eip7623TransitionTimestamp": env.HIVE_PRAGUE_TIMESTAMP|to_hex,
+
     # Other chain parameters
     "networkID": env.HIVE_NETWORK_ID|to_hex,
     "chainID": env.HIVE_CHAIN_ID|to_hex,
+
+    "blobSchedule": {
+      "cancun": {
+        "target": (if env.HIVE_CANCUN_BLOB_TARGET then env.HIVE_CANCUN_BLOB_TARGET|to_hex else "0x3" end),
+        "max": (if env.HIVE_CANCUN_BLOB_MAX then env.HIVE_CANCUN_BLOB_MAX|to_hex else "0x6" end),
+        "baseFeeUpdateFraction": (if env.HIVE_CANCUN_BLOB_BASE_FEE_UPDATE_FRACTION then env.HIVE_CANCUN_BLOB_BASE_FEE_UPDATE_FRACTION|to_hex else "0x32f0ed" end)
+      },
+      "prague": {
+        "target": (if env.HIVE_PRAGUE_BLOB_TARGET then env.HIVE_PRAGUE_BLOB_TARGET|to_hex else "0x6" end),
+        "max": (if env.HIVE_PRAGUE_BLOB_MAX then env.HIVE_PRAGUE_BLOB_MAX|to_hex else "0x9" end),
+        "baseFeeUpdateFraction": (if env.HIVE_PRAGUE_BLOB_BASE_FEE_UPDATE_FRACTION then env.HIVE_PRAGUE_BLOB_BASE_FEE_UPDATE_FRACTION|to_hex else "0x4c6964" end)
+      }
+    },
   },
   "genesis": {
     "seal": {
@@ -150,6 +192,9 @@ def clique_engine:
     "extraData": .extraData,
     "gasLimit": .gasLimit,
     "baseFeePerGas": .baseFeePerGas,
+    "blobGasUsed": .blobGasUsed,
+    "excessBlobGas": .excessBlobGas,
+    "parentBeaconBlockRoot": .parentBeaconBlockRoot,
   },
   "accounts": ((.alloc|with_entries(.key|="0x"+.)) * {
     "0x0000000000000000000000000000000000000001": {

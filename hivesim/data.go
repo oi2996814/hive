@@ -1,5 +1,7 @@
 package hivesim
 
+import "slices"
+
 // SuiteID identifies a test suite context.
 type SuiteID uint32
 
@@ -12,6 +14,15 @@ type TestResult struct {
 	Details string `json:"details"`
 }
 
+// TestStartInfo contains metadata about a test which is supplied to the hive API.
+type TestStartInfo struct {
+	Name        string `json:"name"`
+	DisplayName string `json:"display_name"`
+	Location    string `json:"location"`
+	Category    string `json:"category"`
+	Description string `json:"description"`
+}
+
 // ExecInfo is the result of running a command in a client container.
 type ExecInfo struct {
 	Stdout   string `json:"stdout"`
@@ -19,32 +30,19 @@ type ExecInfo struct {
 	ExitCode int    `json:"exitCode"`
 }
 
-// Params contains client launch parameters.
-// This exists because tests usually want to define common parameters as
-// a global variable and then customize them for specific clients.
-type Params map[string]string
-
-var _ StartOption = (Params)(nil)
-
-// Apply implements StartOption.
-func (p Params) Apply(setup *clientSetup) {
-	for k, v := range p {
-		setup.parameters[k] = v
-	}
+// ClientMetadata is part of the ClientDefinition and lists metadata
+type ClientMetadata struct {
+	Roles []string `yaml:"roles" json:"roles"`
 }
 
-// Set returns a copy of the parameters with 'key' set to 'value'.
-func (p Params) Set(key, value string) Params {
-	cpy := p.Copy()
-	cpy[key] = value
-	return cpy
+// ClientDefinition is served by the /clients API endpoint to list the available clients
+type ClientDefinition struct {
+	Name    string         `json:"name"`
+	Version string         `json:"version"`
+	Meta    ClientMetadata `json:"meta"`
 }
 
-// Copy returns a copy of the parameters.
-func (p Params) Copy() Params {
-	cpy := make(Params, len(p))
-	for k, v := range p {
-		cpy[k] = v
-	}
-	return cpy
+// HasRole reports whether the client has the given role.
+func (m *ClientDefinition) HasRole(role string) bool {
+	return slices.Contains(m.Meta.Roles, role)
 }

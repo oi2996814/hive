@@ -5,14 +5,12 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io/ioutil"
+	"log/slog"
 	"net/http"
 	"os"
 	"path/filepath"
 	"sync"
 	"time"
-
-	"gopkg.in/inconshreveable/log15.v2"
 )
 
 var (
@@ -28,14 +26,6 @@ var (
 	ErrTestSuiteLimited         = errors.New("testsuite test count is limited")
 )
 
-// ClientDefinition is served by the /clients API endpoint to list the available clients
-type ClientDefinition struct {
-	Name    string         `json:"name"`
-	Version string         `json:"version"`
-	Image   string         `json:"-"` // not exposed via API
-	Meta    ClientMetadata `json:"meta"`
-}
-
 // SimEnv contains the simulation parameters.
 type SimEnv struct {
 	LogDir string
@@ -43,21 +33,45 @@ type SimEnv struct {
 	// Parameters of simulation.
 	SimLogLevel    int
 	SimParallelism int
-	SimTestLimit   int
+	SimRandomSeed  int
+	SimTestPattern string
+	SimBuildArgs   []string
+
+	// This is the time limit for the simulation run.
+	// There is no default limit.
+	SimDurationLimit time.Duration
+
+	// These are the clients which are made available to the simulator.
+	// If unset (i.e. nil), all built clients are used.
+	ClientList []ClientDesignator
 
 	// This configures the amount of time the simulation waits
 	// for the client to open port 8545 after launching the container.
 	ClientStartTimeout time.Duration
+}
 
-	// client name -> client definition
-	Definitions map[string]*ClientDefinition
+// SimResult summarizes the results of a simulation run.
+type SimResult struct {
+	Suites       int
+	SuitesFailed int
+	Tests        int
+	TestsFailed  int
+}
+
+// HiveInfo contains information about the hive instance running the simulation.
+type HiveInfo struct {
+	Command    []string           `json:"command"`
+	ClientFile []ClientDesignator `json:"clientFile"`
+	Commit     string             `json:"commit"`
+	Date       string             `json:"date"`
 }
 
 // TestManager collects test results during a simulation run.
 type TestManager struct {
-	config      SimEnv
-	backend     ContainerBackend
-	testLimiter int
+	config     SimEnv
+	backend    ContainerBackend
+	clientDefs []*ClientDefinition
+	hiveInfo   HiveInfo
 
 	simContainerID string
 	simLogFile     string
@@ -76,11 +90,15 @@ type TestManager struct {
 	results           map[TestSuiteID]*TestSuite
 }
 
-func NewTestManager(config SimEnv, b ContainerBackend, testLimiter int) *TestManager {
+func NewTestManager(config SimEnv, b ContainerBackend, clients []*ClientDefinition, hiveInfo HiveInfo) *TestManager {
+	if hiveInfo.Commit == "" && hiveInfo.Date == "" {
+		hiveInfo.Commit, hiveInfo.Date = hiveVersion()
+	}
 	return &TestManager{
+		clientDefs:        clients,
 		config:            config,
 		backend:           b,
-		testLimiter:       testLimiter,
+		hiveInfo:          hiveInfo,
 		runningTestSuites: make(map[TestSuiteID]*TestSuite),
 		runningTestCases:  make(map[TestID]*TestCase),
 		results:           make(map[TestSuiteID]*TestSuite),
@@ -110,7 +128,7 @@ func (manager *TestManager) Results() map[TestSuiteID]*TestSuite {
 
 // API returns the simulation API handler.
 func (manager *TestManager) API() http.Handler {
-	return newSimulationAPI(manager.backend, manager.config, manager)
+	return newSimulationAPI(manager.backend, manager.config, manager, manager.hiveInfo)
 }
 
 // IsTestSuiteRunning checks if the test suite is still running and returns it if so
@@ -135,6 +153,7 @@ func (manager *TestManager) IsTestRunning(test TestID) (*TestCase, bool) {
 func (manager *TestManager) Terminate() error {
 	terminationSummary := &TestResult{
 		Pass:    false,
+		Timeout: true,
 		Details: "Test was terminated by host",
 	}
 	manager.testSuiteMutex.Lock()
@@ -223,7 +242,7 @@ func (manager *TestManager) RemoveNetwork(testSuite TestSuiteID, network string)
 func (manager *TestManager) PruneNetworks(testSuite TestSuiteID) []error {
 	var errs []error
 	for name := range manager.networks[testSuite] {
-		log15.Info("removing docker network", "name", name)
+		slog.Info("removing docker network", "name", name)
 		if err := manager.RemoveNetwork(testSuite, name); err != nil {
 			errs = append(errs, err)
 		}
@@ -292,6 +311,15 @@ func (manager *TestManager) ConnectContainer(testSuite TestSuiteID, networkName,
 	return manager.backend.ConnectContainer(containerID, networkID)
 }
 
+// NetworkExists reports whether a network exists in the current test context.
+func (manager *TestManager) NetworkExists(testSuite TestSuiteID, networkName string) bool {
+	manager.networkMutex.RLock()
+	defer manager.networkMutex.RUnlock()
+
+	_, exists := manager.networks[testSuite][networkName]
+	return exists
+}
+
 // DisconnectContainer disconnects the given container from the given network.
 func (manager *TestManager) DisconnectContainer(testSuite TestSuiteID, networkName, containerID string) error {
 	manager.networkMutex.RLock()
@@ -332,6 +360,9 @@ func (manager *TestManager) doEndSuite(testSuite TestSuiteID) error {
 			return ErrTestSuiteRunning
 		}
 	}
+	if suite.testDetailsFile != nil {
+		suite.testDetailsFile.Close()
+	}
 	// Write the result.
 	if manager.config.LogDir != "" {
 		err := writeSuiteFile(suite, manager.config.LogDir)
@@ -342,7 +373,7 @@ func (manager *TestManager) doEndSuite(testSuite TestSuiteID) error {
 	// remove the test suite's left-over docker networks.
 	if errs := manager.PruneNetworks(testSuite); len(errs) > 0 {
 		for _, err := range errs {
-			log15.Error("could not remove network", "err", err)
+			slog.Error("could not remove network", "err", err)
 		}
 	}
 	// Move the suite to results.
@@ -356,20 +387,41 @@ func (manager *TestManager) StartTestSuite(name string, description string) (Tes
 	manager.testSuiteMutex.Lock()
 	defer manager.testSuiteMutex.Unlock()
 
-	var newSuiteID = TestSuiteID(manager.testSuiteCounter)
+	newSuiteID := TestSuiteID(manager.testSuiteCounter)
+
+	var (
+		testLogPath string
+		testLogFile *os.File
+	)
+	if manager.config.LogDir != "" {
+		testLogPath = fmt.Sprintf("details/%d-%s-%d.log", time.Now().Unix(), manager.simContainerID, newSuiteID)
+		fp := filepath.Join(manager.config.LogDir, filepath.FromSlash(testLogPath))
+
+		if err := os.MkdirAll(filepath.Dir(fp), 0755); err != nil {
+			return 0, err
+		}
+		file, err := os.OpenFile(fp, os.O_CREATE|os.O_WRONLY, 0644)
+		if err != nil {
+			return 0, err
+		}
+		testLogFile = file
+	}
+
 	manager.runningTestSuites[newSuiteID] = &TestSuite{
-		ID:             newSuiteID,
-		Name:           name,
-		Description:    description,
-		ClientVersions: make(map[string]string),
-		TestCases:      make(map[TestID]*TestCase),
-		SimulatorLog:   manager.simLogFile,
+		ID:              newSuiteID,
+		Name:            name,
+		Description:     description,
+		ClientVersions:  make(map[string]string),
+		TestCases:       make(map[TestID]*TestCase),
+		SimulatorLog:    manager.simLogFile,
+		TestDetailsLog:  testLogPath,
+		testDetailsFile: testLogFile,
 	}
 	manager.testSuiteCounter++
 	return newSuiteID, nil
 }
 
-//StartTest starts a new test case, returning the testcase id as a context identifier
+// StartTest starts a new test case, returning the testcase id as a context identifier
 func (manager *TestManager) StartTest(testSuiteID TestSuiteID, name string, description string) (TestID, error) {
 	manager.testCaseMutex.Lock()
 	defer manager.testCaseMutex.Unlock()
@@ -378,10 +430,6 @@ func (manager *TestManager) StartTest(testSuiteID TestSuiteID, name string, desc
 	testSuite, ok := manager.runningTestSuites[testSuiteID]
 	if !ok {
 		return 0, ErrNoSuchTestSuite
-	}
-	// check for a limiter
-	if manager.testLimiter >= 0 && len(testSuite.TestCases) >= manager.testLimiter {
-		return 0, ErrTestSuiteLimited
 	}
 	// increment the testcasecounter
 	manager.testCaseCounter++
@@ -401,23 +449,32 @@ func (manager *TestManager) StartTest(testSuiteID TestSuiteID, name string, desc
 }
 
 // EndTest finishes the test case
-func (manager *TestManager) EndTest(testSuiteRun TestSuiteID, testID TestID, summaryResult *TestResult) error {
+func (manager *TestManager) EndTest(suiteID TestSuiteID, testID TestID, result *TestResult) error {
 	manager.testCaseMutex.Lock()
 	defer manager.testCaseMutex.Unlock()
 
 	// Check if the test case is running
+	testSuite, ok := manager.runningTestSuites[suiteID]
+	if !ok {
+		return ErrNoSuchTestCase
+	}
 	testCase, ok := manager.runningTestCases[testID]
 	if !ok {
 		return ErrNoSuchTestCase
 	}
 	// Make sure there is at least a result summary
-	if summaryResult == nil {
+	if result == nil {
 		return ErrNoSummaryResult
 	}
 
 	// Add the results to the test case
 	testCase.End = time.Now()
-	testCase.SummaryResult = *summaryResult
+	if result.Details != "" && testSuite.testDetailsFile != nil {
+		offsets := manager.writeTestDetails(testSuite, testCase, result.Details)
+		result.Details = ""
+		result.LogOffsets = offsets
+	}
+	testCase.SummaryResult = *result
 
 	// Stop running clients.
 	for _, v := range testCase.ClientInfo {
@@ -431,6 +488,30 @@ func (manager *TestManager) EndTest(testSuiteRun TestSuiteID, testID TestID, sum
 	// Delete from running, if it's still there.
 	delete(manager.runningTestCases, testID)
 	return nil
+}
+
+func (manager *TestManager) writeTestDetails(suite *TestSuite, testCase *TestCase, text string) *TestLogOffsets {
+	var (
+		begin   = suite.testLogOffset
+		header  = "-- " + testCase.Name + "\n"
+		footer  = "\n\n"
+		offsets TestLogOffsets
+	)
+	n, err := fmt.Fprint(suite.testDetailsFile, header, text, footer)
+	suite.testLogOffset += int64(n)
+
+	if err != nil {
+		slog.Error("could not write details file", "err", err)
+		// Write was incomplete, so play it safe with the offsets.
+		offsets.Begin = begin
+		offsets.End = begin + int64(n)
+	} else {
+		// Otherwise, exclude the header and footer in offsets.
+		// They are just written to make the file more readable.
+		offsets.Begin = begin + int64(len(header))
+		offsets.End = offsets.Begin + int64(len(text))
+	}
+	return &offsets
 }
 
 // RegisterNode is used by test suite hosts to register the creation of a node in the context of a test
@@ -474,6 +555,46 @@ func (manager *TestManager) StopNode(testID TestID, nodeID string) error {
 	return nil
 }
 
+// PauseNode pauses a client container.
+func (manager *TestManager) PauseNode(testID TestID, nodeID string) error {
+	manager.testCaseMutex.Lock()
+	defer manager.testCaseMutex.Unlock()
+
+	testCase, ok := manager.runningTestCases[testID]
+	if !ok {
+		return ErrNoSuchNode
+	}
+	nodeInfo, ok := testCase.ClientInfo[nodeID]
+	if !ok {
+		return ErrNoSuchNode
+	}
+	// Pause the container.
+	if err := manager.backend.PauseContainer(nodeInfo.ID); err != nil {
+		return fmt.Errorf("unable to pause client: %v", err)
+	}
+	return nil
+}
+
+// UnpauseNode unpauses a client container.
+func (manager *TestManager) UnpauseNode(testID TestID, nodeID string) error {
+	manager.testCaseMutex.Lock()
+	defer manager.testCaseMutex.Unlock()
+
+	testCase, ok := manager.runningTestCases[testID]
+	if !ok {
+		return ErrNoSuchNode
+	}
+	nodeInfo, ok := testCase.ClientInfo[nodeID]
+	if !ok {
+		return ErrNoSuchNode
+	}
+	// Unpause the container.
+	if err := manager.backend.UnpauseContainer(nodeInfo.ID); err != nil {
+		return fmt.Errorf("unable to unpause client: %v", err)
+	}
+	return nil
+}
+
 // writeSuiteFile writes the simulation result to the log directory.
 func writeSuiteFile(s *TestSuite, logdir string) error {
 	suiteData, err := json.Marshal(s)
@@ -486,5 +607,5 @@ func writeSuiteFile(s *TestSuite, logdir string) error {
 	suiteFileName := fmt.Sprintf("%v-%x.json", time.Now().Unix(), b)
 	suiteFile := filepath.Join(logdir, suiteFileName)
 	// Write it.
-	return ioutil.WriteFile(suiteFile, suiteData, 0644)
+	return os.WriteFile(suiteFile, suiteData, 0644)
 }

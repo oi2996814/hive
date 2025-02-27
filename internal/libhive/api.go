@@ -6,19 +6,17 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"mime/multipart"
-	"net"
 	"net/http"
 	"path"
 	"path/filepath"
-	"sort"
 	"strconv"
 	"strings"
 	"time"
 
-	"github.com/ethereum/go-ethereum/p2p/enode"
+	"github.com/ethereum/hive/internal/simapi"
 	"github.com/gorilla/mux"
-	"gopkg.in/inconshreveable/log15.v2"
 )
 
 // hiveEnvvarPrefix is the prefix of the environment variables names that should
@@ -29,16 +27,19 @@ const hiveEnvvarPrefix = "HIVE_"
 const defaultStartTimeout = time.Duration(60 * time.Second)
 
 // newSimulationAPI creates handlers for the simulation API.
-func newSimulationAPI(b ContainerBackend, env SimEnv, tm *TestManager) http.Handler {
-	api := &simAPI{backend: b, env: env, tm: tm}
+func newSimulationAPI(b ContainerBackend, env SimEnv, tm *TestManager, hive HiveInfo) http.Handler {
+	api := &simAPI{backend: b, env: env, tm: tm, hive: hive}
 
 	// API routes.
 	router := mux.NewRouter()
+	router.HandleFunc("/hive", api.getHiveInfo).Methods("GET")
 	router.HandleFunc("/clients", api.getClientTypes).Methods("GET")
 	router.HandleFunc("/testsuite/{suite}/test/{test}/node/{node}/exec", api.execInClient).Methods("POST")
-	router.HandleFunc("/testsuite/{suite}/test/{test}/node/{node}", api.getEnodeURL).Methods("GET")
+	router.HandleFunc("/testsuite/{suite}/test/{test}/node/{node}", api.getNodeStatus).Methods("GET")
 	router.HandleFunc("/testsuite/{suite}/test/{test}/node", api.startClient).Methods("POST")
 	router.HandleFunc("/testsuite/{suite}/test/{test}/node/{node}", api.stopClient).Methods("DELETE")
+	router.HandleFunc("/testsuite/{suite}/test/{test}/node/{node}/pause", api.pauseClient).Methods("POST")
+	router.HandleFunc("/testsuite/{suite}/test/{test}/node/{node}/pause", api.unpauseClient).Methods("DELETE")
 	router.HandleFunc("/testsuite/{suite}/test", api.startTest).Methods("POST")
 	// post because the delete http verb does not always support a message body
 	router.HandleFunc("/testsuite/{suite}/test/{test}", api.endTest).Methods("POST")
@@ -56,83 +57,82 @@ type simAPI struct {
 	backend ContainerBackend
 	env     SimEnv
 	tm      *TestManager
+	hive    HiveInfo
+}
+
+// getHiveInfo returns information about the hive server instance.
+func (api *simAPI) getHiveInfo(w http.ResponseWriter, r *http.Request) {
+	slog.Info("API: hive info requested")
+	serveJSON(w, api.hive)
 }
 
 // getClientTypes returns all known client types.
 func (api *simAPI) getClientTypes(w http.ResponseWriter, r *http.Request) {
-	w.Header().Set("Content-Type", "application/json")
-
-	if r.URL.Query().Get("metadata") != "" {
-		// New-style response with metadata included.
-		clients := make([]*ClientDefinition, 0, len(api.env.Definitions))
-		for _, def := range api.env.Definitions {
-			clients = append(clients, def)
-		}
-		sort.Slice(clients, func(i, j int) bool { return clients[i].Name < clients[j].Name })
-		json.NewEncoder(w).Encode(clients)
-	} else {
-		clients := make([]string, 0, len(api.env.Definitions))
-		for name := range api.env.Definitions {
-			clients = append(clients, name)
-		}
-		sort.Strings(clients)
-		json.NewEncoder(w).Encode(clients)
-	}
+	serveJSON(w, api.tm.clientDefs)
 }
 
 // startSuite starts a suite.
 func (api *simAPI) startSuite(w http.ResponseWriter, r *http.Request) {
-	if err := r.ParseForm(); err != nil {
-		http.Error(w, err.Error(), http.StatusBadRequest)
+	var suite simapi.TestRequest
+	if err := json.NewDecoder(r.Body).Decode(&suite); err != nil {
+		serveError(w, err, http.StatusBadRequest)
+		return
+	}
+	if suite.Name == "" {
+		serveError(w, errors.New("suite name is empty"), http.StatusBadRequest)
 		return
 	}
 
-	name := r.Form.Get("name")
-	desc := r.Form.Get("description")
-	suiteID, err := api.tm.StartTestSuite(name, desc)
+	suiteID, err := api.tm.StartTestSuite(suite.Name, suite.Description)
 	if err != nil {
-		log15.Error("API: StartTestSuite failed", "error", err)
-		http.Error(w, err.Error(), http.StatusInternalServerError)
+		slog.Error("API: StartTestSuite failed", "error", err)
+		serveError(w, err, http.StatusInternalServerError)
 	}
-	log15.Info("API: suite started", "suite", suiteID, "name", name)
-	fmt.Fprintf(w, "%d", suiteID)
+	slog.Info("API: suite started", "suite", suiteID, "name", suite.Name)
+	serveJSON(w, suiteID)
 }
 
 // endSuite ends a suite.
 func (api *simAPI) endSuite(w http.ResponseWriter, r *http.Request) {
 	suiteID, err := api.requestSuite(r)
 	if err != nil {
-		http.Error(w, err.Error(), http.StatusBadRequest)
+		serveError(w, err, http.StatusBadRequest)
 		return
 	}
 	if err := api.tm.EndTestSuite(suiteID); err != nil {
-		log15.Error("API: EndTestSuite failed", "suite", suiteID, "error", err)
-		http.Error(w, err.Error(), http.StatusInternalServerError)
+		slog.Error("API: EndTestSuite failed", "suite", suiteID, "error", err)
+		serveError(w, err, http.StatusInternalServerError)
 		return
 	}
-	log15.Info("API: suite ended", "suite", suiteID)
+	slog.Info("API: suite ended", "suite", suiteID)
+	serveOK(w)
 }
 
 // startTest signals the start of a test case.
 func (api *simAPI) startTest(w http.ResponseWriter, r *http.Request) {
 	suiteID, err := api.requestSuite(r)
 	if err != nil {
-		http.Error(w, err.Error(), http.StatusBadRequest)
+		serveError(w, err, http.StatusBadRequest)
 		return
 	}
-	if err := r.ParseForm(); err != nil {
-		http.Error(w, err.Error(), http.StatusBadRequest)
+	var test simapi.TestRequest
+	if err := json.NewDecoder(r.Body).Decode(&test); err != nil {
+		serveError(w, err, http.StatusBadRequest)
+		return
+	}
+	if test.Name == "" {
+		serveError(w, errors.New("test name is empty"), http.StatusBadRequest)
 		return
 	}
 
-	name := r.Form.Get("name")
-	testID, err := api.tm.StartTest(suiteID, name, r.Form.Get("description"))
+	testID, err := api.tm.StartTest(suiteID, test.Name, test.Description)
 	if err != nil {
-		msg := fmt.Sprintf("can't start test case: %s", err.Error())
-		http.Error(w, msg, http.StatusInternalServerError)
+		err := fmt.Errorf("can't start test case: %s", err.Error())
+		serveError(w, err, http.StatusInternalServerError)
+		return
 	}
-	log15.Info("API: test started", "suite", suiteID, "test", testID, "name", name)
-	fmt.Fprintf(w, "%d", testID)
+	slog.Info("API: test started", "suite", suiteID, "test", testID, "name", test.Name)
+	serveJSON(w, testID)
 }
 
 // endTest signals the end of a test case. It also shuts down all clients
@@ -140,82 +140,102 @@ func (api *simAPI) startTest(w http.ResponseWriter, r *http.Request) {
 func (api *simAPI) endTest(w http.ResponseWriter, r *http.Request) {
 	suiteID, testID, err := api.requestSuiteAndTest(r)
 	if err != nil {
-		http.Error(w, err.Error(), http.StatusBadRequest)
-		return
-	}
-	if err := r.ParseForm(); err != nil {
-		http.Error(w, err.Error(), http.StatusBadRequest)
+		serveError(w, err, http.StatusBadRequest)
 		return
 	}
 
-	var (
-		summary         = TestResult{Pass: false}
-		responseWritten = false // Have we already committed a response?
-	)
-	defer func() {
-		err := api.tm.EndTest(suiteID, testID, &summary)
-		if err == nil {
-			log15.Info("API: test ended", "suite", suiteID, "test", testID, "pass", summary.Pass)
-			return
-		}
-		log15.Error("API: EndTest failed", "suite", suiteID, "test", testID, "error", err)
-		if !responseWritten {
-			msg := fmt.Sprintf("can't end test case: %v", err)
-			http.Error(w, msg, http.StatusInternalServerError)
-		}
-	}()
+	var result TestResult
+	if err := json.NewDecoder(r.Body).Decode(&result); err != nil {
+		slog.Error("API: invalid result data in endTest", "suite", suiteID, "test", testID, "error", err)
+		err := fmt.Errorf("can't unmarshal result: %v", err)
+		serveError(w, err, http.StatusBadRequest)
+		return
+	}
 
-	// Summary is required.
-	summaryData := r.Form.Get("summaryresult")
-	if summaryData == "" {
-		http.Error(w, "missing 'summaryresult' in request", http.StatusBadRequest)
-		responseWritten = true
+	err = api.tm.EndTest(suiteID, testID, &result)
+	if err != nil {
+		slog.Error("API: EndTest failed", "suite", suiteID, "test", testID, "error", err)
+		err := fmt.Errorf("can't end test case: %v", err)
+		serveError(w, err, http.StatusInternalServerError)
 		return
 	}
-	if err = json.Unmarshal([]byte(summaryData), &summary); err != nil {
-		log15.Error("API: invalid summary data in endTest", "test", testID, "error", err)
-		msg := fmt.Sprintf("can't unmarshal 'summaryresult': %v", err)
-		http.Error(w, msg, http.StatusBadRequest)
-		responseWritten = true
-		return
-	}
+
+	slog.Info("API: test ended", "suite", suiteID, "test", testID, "pass", result.Pass)
+	serveOK(w)
 }
 
 // startClient starts a client container.
 func (api *simAPI) startClient(w http.ResponseWriter, r *http.Request) {
 	suiteID, testID, err := api.requestSuiteAndTest(r)
 	if err != nil {
-		http.Error(w, err.Error(), http.StatusBadRequest)
+		serveError(w, err, http.StatusBadRequest)
 		return
 	}
 
 	// Client launch parameters are given as multipart/form-data.
-	if err := r.ParseMultipartForm((1 << 10) * 4); err != nil {
-		log15.Error("API: could not parse node request", "error", err)
-		http.Error(w, "could not parse node request", http.StatusBadRequest)
+	const maxMemory = 8 * 1024 * 1024
+	if err := r.ParseMultipartForm(maxMemory); err != nil {
+		slog.Error("API: could not parse node request", "error", err)
+		err := fmt.Errorf("could not parse node request")
+		serveError(w, err, http.StatusBadRequest)
 		return
 	}
-	files := make(map[string]*multipart.FileHeader)
-	for key, fheaders := range r.MultipartForm.File {
-		if len(fheaders) > 0 {
-			files[key] = fheaders[0]
-		}
+	defer r.MultipartForm.RemoveAll()
+
+	if !r.Form.Has("config") {
+		slog.Error("API: missing 'config' parameter in node request", "error", err)
+		err := fmt.Errorf("missing 'config' parameter in node request")
+		serveError(w, err, http.StatusBadRequest)
+		return
 	}
-	env := make(map[string]string)
-	for key, vals := range r.MultipartForm.Value {
-		if strings.HasPrefix(key, hiveEnvvarPrefix) {
-			env[key] = vals[0]
-		}
-	}
-	// Set default client loglevel to sim loglevel.
-	if env["HIVE_LOGLEVEL"] == "" {
-		env["HIVE_LOGLEVEL"] = strconv.Itoa(api.env.SimLogLevel)
+	var clientConfig simapi.NodeConfig
+	if err := json.Unmarshal([]byte(r.Form.Get("config")), &clientConfig); err != nil {
+		slog.Error("API: invalid 'config' parameter in node request", "error", err)
+		err := fmt.Errorf("invalid 'config' parameter in node request")
+		serveError(w, err, http.StatusBadRequest)
+		return
 	}
 
 	// Get the client name.
-	clientDef, ok := api.checkClient(r, w)
-	if !ok {
+	clientDef, err := api.checkClient(&clientConfig)
+	if err != nil {
+		slog.Error("API: " + err.Error())
+		serveError(w, err, http.StatusBadRequest)
 		return
+	}
+	// Get the network names, if any, for the container to be connected to at start.
+	networks, err := api.checkClientNetworks(&clientConfig, suiteID)
+	if err != nil {
+		slog.Error("API: "+err.Error(), "client", clientDef.Name)
+		serveError(w, err, http.StatusBadRequest)
+		return
+	}
+
+	files := make(map[string]*multipart.FileHeader)
+	for key, fheaders := range r.MultipartForm.File {
+		if len(fheaders) > 0 {
+			// Note: the PARAMETER NAME (not the 'filename') is used as the destination
+			// file path in the container. This is because RFC 7578 says that directory
+			// components should be ignored in the filename supplied by the form, and
+			// package multipart strips the directory info away at parse time.
+			files[key] = fheaders[0]
+		}
+	}
+
+	// Sanitize environment.
+	env := clientConfig.Environment
+	for k := range env {
+		if !strings.HasPrefix(k, hiveEnvvarPrefix) {
+			delete(env, k)
+		}
+	}
+	// Set default client loglevel to sim loglevel.
+	if env == nil {
+		env = make(map[string]string)
+	}
+
+	if env["HIVE_LOGLEVEL"] == "" {
+		env["HIVE_LOGLEVEL"] = strconv.Itoa(api.env.SimLogLevel)
 	}
 
 	// Set up the timeout.
@@ -230,8 +250,9 @@ func (api *simAPI) startClient(w http.ResponseWriter, r *http.Request) {
 	options := ContainerOptions{Env: env, Files: files}
 	containerID, err := api.backend.CreateContainer(ctx, clientDef.Image, options)
 	if err != nil {
-		log15.Error("API: client container create failed", "client", clientDef.Name, "error", err)
-		http.Error(w, "client container create failed: "+err.Error(), http.StatusInternalServerError)
+		slog.Error("API: client container create failed", "client", clientDef.Name, "error", err)
+		err := fmt.Errorf("client container create failed (%v)", err)
+		serveError(w, err, http.StatusInternalServerError)
 		return
 	}
 
@@ -240,13 +261,22 @@ func (api *simAPI) startClient(w http.ResponseWriter, r *http.Request) {
 	logPath, logFilePath := api.clientLogFilePaths(clientDef.Name, containerID)
 	options.LogFile = logFilePath
 
+	// Connect to the networks if requested, so it is started already joined to each one.
+	for _, network := range networks {
+		if err := api.tm.ConnectContainer(suiteID, network, containerID); err != nil {
+			slog.Error("API: failed to connect container", "network", network, "container", containerID, "error", err)
+			serveError(w, err, http.StatusInternalServerError)
+			return
+		}
+	}
+
 	// by default: check the eth1 port
 	options.CheckLive = 8545
 	if portStr := env["HIVE_CHECK_LIVE_PORT"]; portStr != "" {
 		v, err := strconv.ParseUint(portStr, 10, 16)
 		if err != nil {
-			log15.Error("API: could not parse check-live port", "error", err)
-			http.Error(w, err.Error(), http.StatusBadRequest)
+			slog.Error("API: could not parse check-live port", "error", err)
+			serveError(w, err, http.StatusBadRequest)
 			return
 		}
 		options.CheckLive = uint16(v)
@@ -263,28 +293,28 @@ func (api *simAPI) startClient(w http.ResponseWriter, r *http.Request) {
 			LogFile:        logPath,
 			wait:           info.Wait,
 		}
-		api.tm.testSuiteMutex.Lock()
 
-		// log client version in test suite
-		if suite, ok := api.tm.runningTestSuites[suiteID]; !ok {
-			http.Error(w, ErrNoSuchTestSuite.Error(), http.StatusNotFound)
-			api.tm.testSuiteMutex.Unlock()
-			return
-		} else {
+		// Add client version to the test suite.
+		api.tm.testSuiteMutex.Lock()
+		if suite, ok := api.tm.runningTestSuites[suiteID]; ok {
 			suite.ClientVersions[clientDef.Name] = clientDef.Version
 		}
 		api.tm.testSuiteMutex.Unlock()
 
-		// register the node
+		// Register the node. This should always be done, even if starting the container
+		// failed, to ensure that the failed client log is associated with the test.
 		api.tm.RegisterNode(testID, info.ID, clientInfo)
 	}
 	if err != nil {
-		log15.Error("API: could not start client", "client", clientDef.Name, "container", containerID[:8], "error", err)
-		http.Error(w, "client did not start: "+err.Error(), http.StatusInternalServerError)
+		slog.Error("API: could not start client", "client", clientDef.Name, "container", containerID[:8], "error", err)
+		err := fmt.Errorf("client did not start: %v", err)
+		serveError(w, err, http.StatusInternalServerError)
 		return
 	}
-	log15.Info("API: client "+clientDef.Name+" started", "suite", suiteID, "test", testID, "container", containerID[:8])
-	fmt.Fprintf(w, "%s@%s@%s", info.ID, info.IP, info.MAC)
+
+	// It's started.
+	slog.Info("API: client "+clientDef.Name+" started", "suite", suiteID, "test", testID, "container", containerID[:8])
+	serveJSON(w, &simapi.StartNodeResponse{ID: info.ID, IP: info.IP})
 }
 
 // clientLogFilePaths determines the log file path of a client container.
@@ -298,124 +328,141 @@ func (api *simAPI) clientLogFilePaths(clientName, containerID string) (jsonPath 
 	return jsonPath, file
 }
 
-func (api *simAPI) checkClient(r *http.Request, w http.ResponseWriter) (*ClientDefinition, bool) {
-	name := r.FormValue("CLIENT")
-	if name == "" {
-		log15.Error("API: missing client name in start node request")
-		http.Error(w, "missing 'CLIENT' in request", http.StatusBadRequest)
-		return nil, false
+func (api *simAPI) checkClient(req *simapi.NodeConfig) (*ClientDefinition, error) {
+	if req.Client == "" {
+		return nil, errors.New("missing client type in start request")
 	}
-	def, ok := api.env.Definitions[name]
-	if ok {
-		return def, true
+	for _, client := range api.tm.clientDefs {
+		if client.Name == req.Client {
+			return client, nil
+		}
 	}
-	// Client name not found.
-	log15.Error("API: unknown client name in start node request")
-	http.Error(w, "unknown 'CLIENT' type in request", http.StatusBadRequest)
-	return nil, false
+	return nil, errors.New("unknown client type in start request")
+}
+
+// checkClientNetworks pre-checks the existence of initial networks for a client container.
+func (api *simAPI) checkClientNetworks(req *simapi.NodeConfig, suiteID TestSuiteID) ([]string, error) {
+	for _, network := range req.Networks {
+		if !api.tm.NetworkExists(suiteID, network) {
+			return nil, fmt.Errorf("invalid network name '%s' in client start request", network)
+		}
+	}
+	return req.Networks, nil
 }
 
 // stopClient terminates a client container.
 func (api *simAPI) stopClient(w http.ResponseWriter, r *http.Request) {
 	_, testID, err := api.requestSuiteAndTest(r)
 	if err != nil {
-		http.Error(w, err.Error(), http.StatusBadRequest)
+		serveError(w, err, http.StatusBadRequest)
 		return
 	}
 	node := mux.Vars(r)["node"]
 
 	err = api.tm.StopNode(testID, node)
-	if err == ErrNoSuchNode {
-		http.Error(w, err.Error(), http.StatusBadRequest)
-		return
-	} else if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
-		return
+	switch {
+	case err == ErrNoSuchNode:
+		serveError(w, err, http.StatusNotFound)
+	case err != nil:
+		serveError(w, err, http.StatusInternalServerError)
+	default:
+		serveOK(w)
 	}
 }
 
-// getEnodeURL gets the enode URL of the client.
-func (api *simAPI) getEnodeURL(w http.ResponseWriter, r *http.Request) {
+// pauseClient pauses a client container.
+func (api *simAPI) pauseClient(w http.ResponseWriter, r *http.Request) {
+	_, testID, err := api.requestSuiteAndTest(r)
+	if err != nil {
+		serveError(w, err, http.StatusBadRequest)
+		return
+	}
+	node := mux.Vars(r)["node"]
+
+	err = api.tm.PauseNode(testID, node)
+	switch {
+	case err == ErrNoSuchNode:
+		serveError(w, err, http.StatusNotFound)
+	case err != nil:
+		serveError(w, err, http.StatusInternalServerError)
+	default:
+		serveOK(w)
+	}
+}
+
+// unpauseClient unpauses a client container.
+func (api *simAPI) unpauseClient(w http.ResponseWriter, r *http.Request) {
+	_, testID, err := api.requestSuiteAndTest(r)
+	if err != nil {
+		serveError(w, err, http.StatusBadRequest)
+		return
+	}
+	node := mux.Vars(r)["node"]
+
+	err = api.tm.UnpauseNode(testID, node)
+	switch {
+	case err == ErrNoSuchNode:
+		serveError(w, err, http.StatusNotFound)
+	case err != nil:
+		serveError(w, err, http.StatusInternalServerError)
+	default:
+		serveOK(w)
+	}
+}
+
+// getNodeStatus returns the status of a client container.
+func (api *simAPI) getNodeStatus(w http.ResponseWriter, r *http.Request) {
 	suiteID, testID, err := api.requestSuiteAndTest(r)
 	if err != nil {
-		http.Error(w, err.Error(), http.StatusBadRequest)
+		serveError(w, err, http.StatusBadRequest)
 		return
 	}
 
 	node := mux.Vars(r)["node"]
 	nodeInfo, err := api.tm.GetNodeInfo(suiteID, testID, node)
 	if err != nil {
-		log15.Error("API: can't find node", "node", node, "error", err)
-		http.Error(w, err.Error(), http.StatusNotFound)
-		return
-	}
-	output, err := api.backend.RunEnodeSh(r.Context(), nodeInfo.ID)
-	if err != nil {
-		log15.Error("API: error running enode.sh", "node", node, "error", err)
-		http.Error(w, err.Error(), http.StatusInternalServerError)
+		slog.Error("API: can't find node", "node", node, "error", err)
+		serveError(w, err, http.StatusNotFound)
 		return
 	}
 
-	// Check that the container returned a valid enode URL.
-	output = strings.TrimSpace(output)
-	n, err := enode.ParseV4(output)
-	if err != nil {
-		log15.Error("API: enode.sh returned bad URL", "node", node, "error", err)
-		http.Error(w, err.Error(), http.StatusInternalServerError)
-		return
-	}
-	tcpPort := n.TCP()
-	if tcpPort == 0 {
-		log15.Warn("API: enode.sh returned TCP port zero", "node", node, "client", nodeInfo.Name)
-		tcpPort = 30303
-	}
-	udpPort := n.UDP()
-	if udpPort == 0 {
-		log15.Warn("API: enode.sh returned UDP port zero", "node", node, "client", nodeInfo.Name)
-		udpPort = 30303
-	}
-
-	// Switch out the IP with the container's IP on the primary network.
-	// This is required because the client usually doesn't know its own IP.
-	fixedIP := enode.NewV4(n.Pubkey(), net.ParseIP(nodeInfo.IP), tcpPort, udpPort)
-	io.WriteString(w, fixedIP.URLv4())
+	serveJSON(w, &simapi.NodeResponse{ID: nodeInfo.ID, Name: nodeInfo.Name})
 }
 
 func (api *simAPI) execInClient(w http.ResponseWriter, r *http.Request) {
 	suiteID, testID, err := api.requestSuiteAndTest(r)
 	if err != nil {
-		http.Error(w, err.Error(), http.StatusBadRequest)
+		serveError(w, err, http.StatusBadRequest)
 		return
 	}
+
 	node := mux.Vars(r)["node"]
 	nodeInfo, err := api.tm.GetNodeInfo(suiteID, testID, node)
 	if err != nil {
-		log15.Error("API: can't find node", "node", node, "error", err)
-		http.Error(w, err.Error(), http.StatusNotFound)
+		slog.Error("API: can't find node", "node", node, "error", err)
+		serveError(w, err, http.StatusNotFound)
 		return
 	}
 
 	// Parse and validate the exec request.
 	commandline, err := parseExecRequest(r.Body)
 	if err != nil {
-		log15.Error("API: invalid exec request", "node", node, "error", err)
-		http.Error(w, err.Error(), http.StatusBadRequest)
+		slog.Error("API: invalid exec request", "node", node, "error", err)
+		serveError(w, err, http.StatusBadRequest)
 		return
 	}
 	info, err := api.backend.RunProgram(r.Context(), nodeInfo.ID, commandline)
 	if err != nil {
-		log15.Error("API: client script exec error", "node", node, "error", err)
-		http.Error(w, err.Error(), http.StatusInternalServerError)
+		slog.Error("API: client script exec error", "node", node, "error", err)
+		serveError(w, err, http.StatusInternalServerError)
 		return
 	}
-	json.NewEncoder(w).Encode(&info)
+	serveJSON(w, &info)
 }
 
 // parseExecRequest decodes and validates a client script exec request.
 func parseExecRequest(r io.Reader) ([]string, error) {
-	var request struct {
-		Command []string `json:"command"`
-	}
+	var request simapi.ExecRequest
 	if err := json.NewDecoder(r).Decode(&request); err != nil {
 		return nil, fmt.Errorf("invalid JSON: %v", err)
 	}
@@ -434,45 +481,45 @@ func parseExecRequest(r io.Reader) ([]string, error) {
 func (api *simAPI) networkCreate(w http.ResponseWriter, r *http.Request) {
 	suiteID, err := api.requestSuite(r)
 	if err != nil {
-		http.Error(w, err.Error(), http.StatusBadRequest)
+		serveError(w, err, http.StatusBadRequest)
 		return
 	}
 
 	networkName := mux.Vars(r)["network"]
 	err = api.tm.CreateNetwork(suiteID, networkName)
 	if err != nil {
-		log15.Error("API: failed to create network", "network", networkName, "error", err)
-		http.Error(w, err.Error(), http.StatusBadRequest)
+		slog.Error("API: failed to create network", "network", networkName, "error", err)
+		serveError(w, err, http.StatusBadRequest)
 		return
 	}
-	log15.Info("API: network created", "name", networkName)
-	fmt.Fprint(w, "success")
+	slog.Info("API: network created", "name", networkName)
+	serveOK(w)
 }
 
 // networkRemove removes a docker network.
 func (api *simAPI) networkRemove(w http.ResponseWriter, r *http.Request) {
 	suiteID, err := api.requestSuite(r)
 	if err != nil {
-		http.Error(w, err.Error(), http.StatusBadRequest)
+		serveError(w, err, http.StatusBadRequest)
 		return
 	}
 
 	network := mux.Vars(r)["network"]
 	err = api.tm.RemoveNetwork(suiteID, network)
 	if err != nil {
-		log15.Error("API: failed to remove network", "network", network, "error", err)
-		http.Error(w, err.Error(), http.StatusInternalServerError)
+		slog.Error("API: failed to remove network", "network", network, "error", err)
+		serveError(w, err, http.StatusInternalServerError)
 		return
 	}
-	log15.Info("API: docker network removed", "network", network)
-	fmt.Fprint(w, "success")
+	slog.Info("API: docker network removed", "network", network)
+	serveOK(w)
 }
 
 // networkIPGet gets the IP address of a container on a network.
 func (api *simAPI) networkIPGet(w http.ResponseWriter, r *http.Request) {
 	suiteID, err := api.requestSuite(r)
 	if err != nil {
-		http.Error(w, err.Error(), http.StatusBadRequest)
+		serveError(w, err, http.StatusBadRequest)
 		return
 	}
 
@@ -480,48 +527,50 @@ func (api *simAPI) networkIPGet(w http.ResponseWriter, r *http.Request) {
 	network := mux.Vars(r)["network"]
 	ipAddr, err := api.tm.ContainerIP(suiteID, network, node)
 	if err != nil {
-		log15.Error("API: failed to get container IP", "container", node, "error", err)
-		http.Error(w, err.Error(), http.StatusInternalServerError)
+		slog.Error("API: failed to get container IP", "container", node, "error", err)
+		serveError(w, err, http.StatusInternalServerError)
 		return
 	}
-	log15.Info("API: container IP requested", "network", network, "container", node, "ip", ipAddr)
-	fmt.Fprint(w, ipAddr)
+	slog.Info("API: container IP requested", "network", network, "container", node, "ip", ipAddr)
+	serveJSON(w, ipAddr)
 }
 
 // networkConnect connects a container to a network.
 func (api *simAPI) networkConnect(w http.ResponseWriter, r *http.Request) {
 	suiteID, err := api.requestSuite(r)
 	if err != nil {
-		http.Error(w, err.Error(), http.StatusBadRequest)
+		serveError(w, err, http.StatusBadRequest)
 		return
 	}
 
 	name := mux.Vars(r)["network"]
 	containerID := mux.Vars(r)["node"]
 	if err := api.tm.ConnectContainer(suiteID, name, containerID); err != nil {
-		log15.Error("API: failed to connect container", "network", name, "container", containerID, "error", err)
-		http.Error(w, err.Error(), http.StatusInternalServerError)
+		slog.Error("API: failed to connect container", "network", name, "container", containerID, "error", err)
+		serveError(w, err, http.StatusInternalServerError)
 		return
 	}
-	log15.Info("API: container connected to network", "network", name, "container", containerID)
+	slog.Info("API: container connected to network", "network", name, "container", containerID)
+	serveOK(w)
 }
 
 // networkDisconnect disconnects a container from a network.
 func (api *simAPI) networkDisconnect(w http.ResponseWriter, r *http.Request) {
 	suiteID, err := api.requestSuite(r)
 	if err != nil {
-		http.Error(w, err.Error(), http.StatusBadRequest)
+		serveError(w, err, http.StatusBadRequest)
 		return
 	}
 
 	network := mux.Vars(r)["network"]
 	containerID := mux.Vars(r)["node"]
 	if err := api.tm.DisconnectContainer(suiteID, network, containerID); err != nil {
-		log15.Error("API: disconnecting container failed", "network", network, "container", containerID, "error", err)
-		http.Error(w, err.Error(), http.StatusBadRequest)
+		slog.Error("API: disconnecting container failed", "network", network, "container", containerID, "error", err)
+		serveError(w, err, http.StatusInternalServerError)
 		return
 	}
-	log15.Info("API: container disconnected", "network", network, "container", containerID)
+	slog.Info("API: container disconnected", "network", network, "container", containerID)
+	serveOK(w)
 }
 
 // requestSuite returns the suite ID from the request body and checks that
@@ -564,4 +613,29 @@ func (api *simAPI) requestSuiteAndTest(r *http.Request) (TestSuiteID, TestID, er
 	}
 	testID, err := api.requestTest(r)
 	return suiteID, testID, err
+}
+
+func serveJSON(w http.ResponseWriter, value interface{}) {
+	resp, err := json.Marshal(value)
+	if err != nil {
+		slog.Error("API: internal error while encoding response", "error", err)
+		serveError(w, errors.New("internal error"), http.StatusInternalServerError)
+		return
+	}
+	w.Header().Set("content-type", "application/json")
+	w.WriteHeader(http.StatusOK)
+	w.Write(resp)
+}
+
+func serveOK(w http.ResponseWriter) {
+	w.Header().Set("content-type", "application/json")
+	w.WriteHeader(http.StatusOK)
+	io.WriteString(w, "null")
+}
+
+func serveError(w http.ResponseWriter, err error, status int) {
+	resp, _ := json.Marshal(&simapi.Error{Error: err.Error()})
+	w.Header().Set("content-type", "application/json")
+	w.WriteHeader(status)
+	w.Write(resp)
 }

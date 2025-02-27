@@ -1,8 +1,9 @@
 package hivesim
 
 import (
+	"errors"
 	"io"
-	"io/ioutil"
+	"net"
 	"net/http/httptest"
 	"os"
 	"reflect"
@@ -12,6 +13,7 @@ import (
 	"github.com/davecgh/go-spew/spew"
 	"github.com/ethereum/hive/internal/fakes"
 	"github.com/ethereum/hive/internal/libhive"
+	"github.com/ethereum/hive/internal/simapi"
 )
 
 // This test checks that the API returns configured client names correctly.
@@ -48,8 +50,22 @@ func TestEnodeReplaceIP(t *testing.T) {
 	// localhost IP.
 	urlBase := "enode://a61215641fb8714a373c80edbfa0ea8878243193f57c96eeb44d0bc019ef295abd4e044fd619bfc4c59731a73fb79afe84e9ab6da0c743ceb479cbb6d263fa91@"
 	hooks := &fakes.BackendHooks{
-		RunEnodeSh: func(string) (string, error) {
-			return urlBase + "127.0.0.1:8000", nil
+		RunProgram: func(containerID string, script []string) (*libhive.ExecInfo, error) {
+			if len(script) != 1 || script[0] != "/hive-bin/enode.sh" {
+				t.Error("hive called wrong client script", script)
+				return nil, errors.New("bad script")
+			}
+			info := &libhive.ExecInfo{Stdout: urlBase + "127.0.0.1:8000"}
+			return info, nil
+		},
+		NetworkNameToID: func(s string) (string, error) {
+			return "bridgeID", nil
+		},
+		ContainerIP: func(string, networkID string) (net.IP, error) {
+			if networkID == "bridgeID" {
+				return net.ParseIP("192.0.1.1"), nil
+			}
+			return net.ParseIP("192.0.2.1"), nil
 		},
 	}
 	tm, srv := newFakeAPI(hooks)
@@ -58,11 +74,11 @@ func TestEnodeReplaceIP(t *testing.T) {
 
 	// Start the client.
 	sim := NewAt(srv.URL)
-	suiteID, err := sim.StartSuite("suite", "", "")
+	suiteID, err := sim.StartSuite(&simapi.TestRequest{Name: "suite"}, "")
 	if err != nil {
 		t.Fatal("can't start suite:", err)
 	}
-	testID, err := sim.StartTest(suiteID, "test", "")
+	testID, err := sim.StartTest(suiteID, TestStartInfo{Name: "test"})
 	if err != nil {
 		t.Fatal("can't start test:", err)
 	}
@@ -71,13 +87,26 @@ func TestEnodeReplaceIP(t *testing.T) {
 	if err != nil {
 		t.Fatal("can't start client:", err)
 	}
+	err = sim.CreateNetwork(suiteID, "network1")
+	if err != nil {
+		t.Fatal("can't create network:", err)
+	}
 
-	// Ask for the enode URL. The IP should be corrected to the primary container IP.
-	url, err := sim.ClientEnodeURL(suiteID, testID, clientID)
+	// Ask for the enode URL on network1. The IP should be corrected to the network1 container IP.
+	url, err := sim.ClientEnodeURLNetwork(suiteID, testID, clientID, "network1")
 	if err != nil {
 		t.Fatal("can't get enode URL:", err)
 	}
 	want := urlBase + "192.0.2.1:8000"
+	if url != want {
+		t.Fatalf("wrong enode URL %q\nwant %q", url, want)
+	}
+	// Ask for the enode URL. The IP should be corrected to the primary container IP.
+	url, err = sim.ClientEnodeURL(suiteID, testID, clientID)
+	if err != nil {
+		t.Fatal("can't get enode URL:", err)
+	}
+	want = urlBase + "192.0.1.1:8000"
 	if url != want {
 		t.Fatalf("wrong enode URL %q\nwant %q", url, want)
 	}
@@ -87,7 +116,7 @@ func TestEnodeReplaceIP(t *testing.T) {
 func TestStartClientStartOptions(t *testing.T) {
 	var lastOptions libhive.ContainerOptions
 	tm, srv := newFakeAPI(&fakes.BackendHooks{
-		StartContainer: func(containerID string, opt libhive.ContainerOptions) (*libhive.ContainerInfo, error) {
+		StartContainer: func(image, containerID string, opt libhive.ContainerOptions) (*libhive.ContainerInfo, error) {
 			lastOptions = opt
 			return &libhive.ContainerInfo{}, nil
 		},
@@ -95,13 +124,13 @@ func TestStartClientStartOptions(t *testing.T) {
 	defer srv.Close()
 	defer tm.Terminate()
 
-	// Start the client.
+	// Start the suite and test.
 	sim := NewAt(srv.URL)
-	suiteID, err := sim.StartSuite("suite", "", "")
+	suiteID, err := sim.StartSuite(&simapi.TestRequest{Name: "suite"}, "")
 	if err != nil {
 		t.Fatal("can't start suite:", err)
 	}
-	testID, err := sim.StartTest(suiteID, "test", "")
+	testID, err := sim.StartTest(suiteID, TestStartInfo{Name: "test"})
 	if err != nil {
 		t.Fatal("can't start test:", err)
 	}
@@ -145,7 +174,7 @@ func TestStartClientStartOptions(t *testing.T) {
 	})
 
 	t.Run("files_options", func(t *testing.T) {
-		file1, err := ioutil.TempFile("", "hivesim_test")
+		file1, err := os.CreateTemp("", "hivesim_test")
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -154,7 +183,7 @@ func TestStartClientStartOptions(t *testing.T) {
 		}
 		defer os.Remove(file1.Name())
 
-		file2, err := ioutil.TempFile("", "hivesim_test")
+		file2, err := os.CreateTemp("", "hivesim_test")
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -188,7 +217,7 @@ func TestStartClientStartOptions(t *testing.T) {
 		})
 
 		mockSrc := func(content string) func() (io.ReadCloser, error) {
-			return func() (io.ReadCloser, error) { return ioutil.NopCloser(strings.NewReader(content)), nil }
+			return func() (io.ReadCloser, error) { return io.NopCloser(strings.NewReader(content)), nil }
 		}
 
 		t.Run("dynamic", func(t *testing.T) {
@@ -214,16 +243,19 @@ func TestStartClientStartOptions(t *testing.T) {
 	})
 }
 
-// This checks that the simulator can run a program
+// This checks running scripts in a client container.
 func TestRunProgram(t *testing.T) {
-	// Set up the backend to return program execution. Simple debug program here.
 	hooks := &fakes.BackendHooks{
 		RunProgram: func(containerID string, cmd []string) (*libhive.ExecInfo, error) {
-			return &libhive.ExecInfo{
-				Stdout:   "out: " + cmd[0],
-				Stderr:   "error output",
-				ExitCode: 42,
-			}, nil
+			if len(cmd) > 0 && cmd[0] == "/hive-bin/echo" {
+				info := &libhive.ExecInfo{
+					Stdout:   "script: " + strings.Join(cmd, " "),
+					Stderr:   "error output",
+					ExitCode: 42,
+				}
+				return info, nil
+			}
+			return nil, errors.New("invalid script")
 		},
 	}
 	tm, srv := newFakeAPI(hooks)
@@ -231,11 +263,11 @@ func TestRunProgram(t *testing.T) {
 	defer tm.Terminate()
 
 	sim := NewAt(srv.URL)
-	suiteID, err := sim.StartSuite("suite", "", "")
+	suiteID, err := sim.StartSuite(&simapi.TestRequest{Name: "suite"}, "")
 	if err != nil {
 		t.Fatal("can't start suite:", err)
 	}
-	testID, err := sim.StartTest(suiteID, "test", "")
+	testID, err := sim.StartTest(suiteID, TestStartInfo{Name: "test"})
 	if err != nil {
 		t.Fatal("can't start test:", err)
 	}
@@ -246,13 +278,12 @@ func TestRunProgram(t *testing.T) {
 		t.Fatal("can't start client:", err)
 	}
 
-	// Run a program
+	// Run the echo script.
 	res, err := sim.ClientExec(suiteID, testID, clientID, []string{"echo", "this"})
 	if err != nil {
 		t.Fatal("failed to run program:", err)
 	}
-
-	if want := "out: /hive-bin/echo"; res.Stdout != want {
+	if want := "script: /hive-bin/echo this"; res.Stdout != want {
 		t.Fatalf("wrong std out %q\nwant %q", res.Stdout, want)
 	}
 	if want := "error output"; res.Stderr != want {
@@ -260,6 +291,15 @@ func TestRunProgram(t *testing.T) {
 	}
 	if want := 42; res.ExitCode != want {
 		t.Fatalf("wrong code %q\nwant %q", res.ExitCode, want)
+	}
+
+	// Run a script that doesn't exist.
+	_, err = sim.ClientExec(suiteID, testID, clientID, []string{"a-script"})
+	if err == nil {
+		t.Fatal("no error from ClientExec for non-existent script")
+	}
+	if err.Error() != "invalid script" {
+		t.Fatalf("wrong error message for non-existent script: %q", err)
 	}
 }
 
@@ -270,11 +310,11 @@ func TestStartClientErrors(t *testing.T) {
 	defer tm.Terminate()
 
 	sim := NewAt(srv.URL)
-	suiteID, err := sim.StartSuite("suite", "", "")
+	suiteID, err := sim.StartSuite(&simapi.TestRequest{Name: "suite"}, "")
 	if err != nil {
 		t.Fatal("can't start suite:", err)
 	}
-	testID, err := sim.StartTest(suiteID, "test", "")
+	testID, err := sim.StartTest(suiteID, TestStartInfo{Name: "test"})
 	if err != nil {
 		t.Fatal("can't start test:", err)
 	}
@@ -293,22 +333,84 @@ func TestStartClientErrors(t *testing.T) {
 	params = map[string]string{"CLIENT": "unknown"}
 	clientID, _, err = sim.StartClient(suiteID, testID, params, nil)
 	if err == nil {
-		t.Fatalf("wanted error for unknown CLIENT parameter, got container ID %v", clientID)
+		t.Fatalf("wanted error for unknown client parameter, got container ID %v", clientID)
 	}
-	if !strings.Contains(err.Error(), "unknown 'CLIENT'") {
-		t.Fatalf("wrong error for GetNode with unknown CLIENT parameter: %q", err.Error())
+	if !strings.Contains(err.Error(), "unknown client type") {
+		t.Fatalf("wrong error for GetNode with unknown client parameter: %q", err.Error())
+	}
+}
+
+func TestStartClientInitialNetworks(t *testing.T) {
+	var (
+		connections = make(map[string]net.IP)
+		ipcounter   byte
+	)
+	tm, srv := newFakeAPI(&fakes.BackendHooks{
+		StartContainer: func(image, containerID string, opt libhive.ContainerOptions) (*libhive.ContainerInfo, error) {
+			return &libhive.ContainerInfo{}, nil
+		},
+		ConnectContainer: func(containerID string, networkID string) error {
+			ipcounter++
+			connections[containerID+networkID] = net.IP{203, 0, 113, ipcounter}
+			return nil
+		},
+		ContainerIP: func(containerID string, networkID string) (net.IP, error) {
+			ip, ok := connections[containerID+networkID]
+			if !ok {
+				return nil, errors.New("container not connected")
+			}
+			return ip, nil
+		},
+	})
+	defer srv.Close()
+	defer tm.Terminate()
+
+	sim := NewAt(srv.URL)
+	suiteID, err := sim.StartSuite(&simapi.TestRequest{Name: "suite"}, "")
+	if err != nil {
+		t.Fatal("can't start suite:", err)
+	}
+	testID, err := sim.StartTest(suiteID, TestStartInfo{Name: "test"})
+	if err != nil {
+		t.Fatal("can't start test:", err)
+	}
+
+	// Create networks.
+	sim.CreateNetwork(suiteID, "Init Network 1")
+	sim.CreateNetwork(suiteID, "Init Network 2")
+	sim.CreateNetwork(suiteID, "Init Network 3")
+	defer sim.RemoveNetwork(suiteID, "Init Network 1")
+	defer sim.RemoveNetwork(suiteID, "Init Network 2")
+	defer sim.RemoveNetwork(suiteID, "Init Network 3")
+
+	// Start the client.
+	opt := WithInitialNetworks([]string{"Init Network 1", "Init Network 3"})
+	containerID, _, err := sim.StartClientWithOptions(suiteID, testID, "client-1", opt)
+	if err != nil {
+		t.Fatalf("failed to start client: %v", err)
+	}
+	if ip, _ := sim.ContainerNetworkIP(suiteID, "Init Network 1", containerID); ip != "203.0.113.1" {
+		t.Fatalf("network 1 was not connected at start: %v", ip)
+	}
+	if ip, _ := sim.ContainerNetworkIP(suiteID, "Init Network 2", containerID); ip != "" {
+		t.Fatalf("network 2 was incorrectly connected at start: %v", ip)
+	}
+	if ip, _ := sim.ContainerNetworkIP(suiteID, "Init Network 3", containerID); ip != "203.0.113.2" {
+		t.Fatalf("network 3 was not connected at start: %v", ip)
 	}
 }
 
 func newFakeAPI(hooks *fakes.BackendHooks) (*libhive.TestManager, *httptest.Server) {
-	env := libhive.SimEnv{
-		Definitions: map[string]*libhive.ClientDefinition{
-			"client-1": {Name: "client-1", Image: "/ignored/in/api", Version: "client-1-version", Meta: libhive.ClientMetadata{Roles: []string{"eth1"}}},
-			"client-2": {Name: "client-2", Image: "/not/exposed/", Version: "client-2-version", Meta: libhive.ClientMetadata{Roles: []string{"beacon"}}},
-		},
+	defs := []*libhive.ClientDefinition{
+		{Name: "client-1", Image: "/ignored/in/api", Version: "client-1-version", Meta: libhive.ClientMetadata{Roles: []string{"eth1"}}},
+		{Name: "client-2", Image: "/not/exposed/", Version: "client-2-version", Meta: libhive.ClientMetadata{Roles: []string{"beacon"}}},
 	}
+	env := libhive.SimEnv{}
 	backend := fakes.NewContainerBackend(hooks)
-	tm := libhive.NewTestManager(env, backend, -1)
+	hiveInfo := libhive.HiveInfo{
+		Command: []string{"/hive"},
+	}
+	tm := libhive.NewTestManager(env, backend, defs, hiveInfo)
 	srv := httptest.NewServer(tm.API())
 	return tm, srv
 }

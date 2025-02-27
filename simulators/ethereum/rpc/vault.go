@@ -50,7 +50,7 @@ func newVault() *vault {
 func (v *vault) generateKey() common.Address {
 	key, err := crypto.GenerateKey()
 	if err != nil {
-		panic(fmt.Errorf("can't generate account key:", err))
+		panic(fmt.Errorf("can't generate account key: %v", err))
 	}
 	addr := crypto.PubkeyToAddress(key.PublicKey)
 
@@ -110,7 +110,7 @@ func (v *vault) createAccountWithSubscription(t *TestEnv, amount *big.Int) commo
 	addressTopic := common.BytesToHash(common.LeftPadBytes(address[:], 32))
 	q := ethereum.FilterQuery{
 		Addresses: []common.Address{predeployedVaultAddr},
-		Topics:    [][]common.Hash{[]common.Hash{eventTopic}, []common.Hash{addressTopic}},
+		Topics:    [][]common.Hash{{eventTopic}, {addressTopic}},
 	}
 	logsSub, err = t.Eth.SubscribeFilterLogs(ctx, q, logs)
 	if err != nil {
@@ -180,7 +180,7 @@ func (v *vault) createAccount(t *TestEnv, amount *big.Int) common.Address {
 
 	// wait for vaultTxConfirmationCount confirmation by checking the balance vaultTxConfirmationCount blocks back.
 	// createAndFundAccountWithSubscription for a better solution using logs
-	for i := uint64(0); i < vaultTxConfirmationCount*4; i++ {
+	for i := uint64(0); i < vaultTxConfirmationCount*12; i++ {
 		number, err := t.Eth.BlockNumber(t.Ctx())
 		if err != nil {
 			t.Fatalf("can't get block number:", err)

@@ -1,6 +1,7 @@
 package hivesim
 
 import (
+	"context"
 	"fmt"
 	"net"
 	"os"
@@ -9,13 +10,27 @@ import (
 	"sync"
 
 	"github.com/ethereum/go-ethereum/rpc"
+	"github.com/ethereum/hive/internal/simapi"
 )
 
 // Suite is the description of a test suite.
 type Suite struct {
-	Name        string
-	Description string
+	Name        string // Name is the unique identifier for the suite [Mandatory]
+	DisplayName string // Display name for the suite (Name will be used if unset) [Optional]
+	Location    string // Documentation output location for the test suite [Optional]
+	Category    string // Category of the test suite [Optional]
+	Description string // Description of the test suite (if empty, suite won't appear in documentation) [Optional]
 	Tests       []AnyTest
+}
+
+func (s *Suite) request() *simapi.TestRequest {
+	return &simapi.TestRequest{
+		Name:        s.Name,
+		DisplayName: s.DisplayName,
+		Location:    s.Location,
+		Category:    s.Category,
+		Description: s.Description,
+	}
 }
 
 // Add adds a test to the suite.
@@ -24,22 +39,46 @@ func (s *Suite) Add(test AnyTest) *Suite {
 	return s
 }
 
-// AnyTest is either Test or SingleClientTest.
+// AnyTest is a TestSpec or ClientTestSpec.
 type AnyTest interface {
-	runTest(*Simulation, SuiteID) error
+	runTest(*Simulation, SuiteID, *Suite) error
+}
+
+// Run executes all given test suites.
+func Run(host *Simulation, suites ...Suite) error {
+	for _, s := range suites {
+		if err := RunSuite(host, s); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// MustRun executes all given test suites, exiting the process if there is a problem
+// reaching the simulation API.
+func MustRun(host *Simulation, suites ...Suite) {
+	for _, s := range suites {
+		MustRunSuite(host, s)
+	}
 }
 
 // RunSuite runs all tests in a suite.
 func RunSuite(host *Simulation, suite Suite) error {
-	logfile := os.Getenv("HIVE_SIMLOG") // TODO: remove this
-	suiteID, err := host.StartSuite(suite.Name, suite.Description, logfile)
+	if !host.m.match(suite.Name, "") {
+		if host.ll > 3 { // hive log level > 3
+			fmt.Fprintf(os.Stderr, "skipping suite %q because it doesn't match test pattern %s\n", suite.Name, host.m.pattern)
+		}
+		return nil
+	}
+
+	suiteID, err := host.StartSuite(suite.request(), "")
 	if err != nil {
 		return err
 	}
 	defer host.EndSuite(suiteID)
 
 	for _, test := range suite.Tests {
-		if err := test.runTest(host, suiteID); err != nil {
+		if err := test.runTest(host, suiteID, &suite); err != nil {
 			return err
 		}
 	}
@@ -60,17 +99,27 @@ func MustRunSuite(host *Simulation, suite Suite) {
 // Using this test type doesn't launch any clients by default. To interact with clients,
 // you can launch them using the t.Client method:
 //
-//    c := t.Client()
-//    c.RPC().Call(...)
+//	c := t.Client()
+//	c.RPC().Call(...)
 //
 // or run a subtest using t.RunClientTest():
 //
-//    t.RunClientTest(hivesim.ClientTestSpec{...})
-//
+//	t.RunClientTest(hivesim.ClientTestSpec{...})
 type TestSpec struct {
-	Name        string
-	Description string
-	Run         func(*T)
+	// These fields are displayed in the UI. Be sure to add
+	// a meaningful description here.
+	Name        string // Name is the unique identifier for the test [Mandatory]
+	DisplayName string // Display name for the test (Name will be used if unset) [Optional]
+	Description string // Description of the test (if empty, test won't appear in documentation) [Optional]
+	Category    string // Category of the test [Optional]
+
+	// If AlwaysRun is true, the test will run even if Name does not match the test
+	// pattern. This option is useful for tests that launch a client instance and
+	// then perform further tests against it.
+	AlwaysRun bool
+
+	// The Run function is invoked when the test executes.
+	Run func(*T)
 }
 
 // ClientTestSpec is a test against a single client. You can either put this in your suite
@@ -81,12 +130,28 @@ type TestSpec struct {
 //
 // If the Name of the test includes "CLIENT", it is replaced by the client name being tested.
 type ClientTestSpec struct {
-	Name        string
-	Role        string
-	Description string
-	Parameters  Params
-	Files       map[string]string
-	Run         func(*T, *Client)
+	// These fields are displayed in the UI. Be sure to add
+	// a meaningful description here.
+	Name        string // Name is the unique identifier for the test [Mandatory]
+	DisplayName string // Display name for the test (Name will be used if unset) [Optional]
+	Description string // Description of the test (if empty, test won't appear in documentation) [Optional]
+	Category    string // Category of the test [Optional]
+
+	// If AlwaysRun is true, the test will run even if Name does not match the test
+	// pattern. This option is useful for tests that launch a client instance and
+	// then perform further tests against it.
+	AlwaysRun bool
+
+	// This filters client types by role.
+	// If no role is specified, the test runs for all available client types.
+	Role string
+
+	// Parameters and Files are launch options for client instances.
+	Parameters Params
+	Files      map[string]string
+
+	// The Run function is invoked when the test executes.
+	Run func(*T, *Client)
 }
 
 // Client represents a running client.
@@ -95,14 +160,20 @@ type Client struct {
 	Container string
 	IP        net.IP
 
-	mu   sync.Mutex
-	rpc  *rpc.Client
-	test *T
+	mu        sync.Mutex
+	rpc       *rpc.Client
+	enginerpc *rpc.Client
+	test      *T
 }
 
-// EnodeURL returns the peer-to-peer endpoint of the client.
+// EnodeURL returns the default peer-to-peer endpoint of the client.
 func (c *Client) EnodeURL() (string, error) {
 	return c.test.Sim.ClientEnodeURL(c.test.SuiteID, c.test.TestID, c.Container)
+}
+
+// EnodeURL returns the peer-to-peer endpoint of the client on a specific network.
+func (c *Client) EnodeURLNetwork(network string) (string, error) {
+	return c.test.Sim.ClientEnodeURLNetwork(c.test.SuiteID, c.test.TestID, c.Container, network)
 }
 
 // RPC returns an RPC client connected to the client's RPC server.
@@ -115,9 +186,33 @@ func (c *Client) RPC() *rpc.Client {
 	return c.rpc
 }
 
+// EngineAPI returns an RPC client connected to an execution-layer client's engine API server.
+func (c *Client) EngineAPI() *rpc.Client {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	if c.enginerpc != nil {
+		return c.enginerpc
+	}
+	auth := rpc.WithHTTPAuth(jwtAuth(ENGINEAPI_JWT_SECRET))
+	url := fmt.Sprintf("http://%v:8551", c.IP)
+	c.enginerpc, _ = rpc.DialOptions(context.Background(), url, auth)
+	return c.enginerpc
+}
+
 // Exec runs a script in the client container.
 func (c *Client) Exec(command ...string) (*ExecInfo, error) {
 	return c.test.Sim.ClientExec(c.test.SuiteID, c.test.TestID, c.Container, command)
+}
+
+// Pauses the client container.
+func (c *Client) Pause() error {
+	return c.test.Sim.PauseClient(c.test.SuiteID, c.test.TestID, c.Container)
+}
+
+// Unpauses the client container.
+func (c *Client) Unpause() error {
+	return c.test.Sim.UnpauseClient(c.test.SuiteID, c.test.TestID, c.Container)
 }
 
 // T is a running test. This is a lot like testing.T, but has some additional methods for
@@ -129,6 +224,7 @@ type T struct {
 	Sim     *Simulation
 	TestID  TestID
 	SuiteID SuiteID
+	suite   *Suite
 	mu      sync.Mutex
 	result  TestResult
 }
@@ -145,7 +241,16 @@ func (t *T) StartClient(clientType string, option ...StartOption) *Client {
 // RunClient runs the given client test against a single client type.
 // It waits for the subtest to complete.
 func (t *T) RunClient(clientType string, spec ClientTestSpec) {
-	runTest(t.Sim, t.SuiteID, spec.Name, spec.Description, func(t *T) {
+	test := testSpec{
+		suiteID:     t.SuiteID,
+		suite:       t.suite,
+		name:        clientTestName(spec.Name, clientType),
+		displayName: spec.DisplayName,
+		category:    spec.Category,
+		desc:        spec.Description,
+		alwaysRun:   spec.AlwaysRun,
+	}
+	runTest(t.Sim, test, func(t *T) {
 		client := t.StartClient(clientType, spec.Parameters, WithStaticFiles(spec.Files))
 		spec.Run(t, client)
 	})
@@ -154,14 +259,14 @@ func (t *T) RunClient(clientType string, spec ClientTestSpec) {
 // RunAllClients runs the given client test against all available client types.
 // It waits for all subtests to complete.
 func (t *T) RunAllClients(spec ClientTestSpec) {
-	spec.runTest(t.Sim, t.SuiteID)
+	spec.runTest(t.Sim, t.SuiteID, t.suite)
 }
 
 // Run runs a subtest of this test. It waits for the subtest to complete before continuing.
 // It is safe to call this from multiple goroutines concurrently, just be sure to wait for
 // all your tests to finish until returning from the parent test.
 func (t *T) Run(spec TestSpec) {
-	runTest(t.Sim, t.SuiteID, spec.Name, spec.Description, spec.Run)
+	spec.runTest(t.Sim, t.SuiteID, t.suite)
 }
 
 // Error is like testing.T.Error.
@@ -228,13 +333,40 @@ func (t *T) FailNow() {
 	runtime.Goexit()
 }
 
-func runTest(host *Simulation, s SuiteID, name, desc string, runit func(t *T)) error {
+type testSpec struct {
+	suiteID     SuiteID
+	suite       *Suite
+	name        string
+	displayName string
+	category    string
+	desc        string
+	alwaysRun   bool
+}
+
+func (spec testSpec) request() TestStartInfo {
+	return TestStartInfo{
+		Name:        spec.name,
+		DisplayName: spec.displayName,
+		Category:    spec.category,
+		Description: spec.desc,
+	}
+}
+
+func runTest(host *Simulation, test testSpec, runit func(t *T)) error {
+	if !test.alwaysRun && !host.m.match(test.suite.Name, test.name) {
+		if host.ll > 3 { // hive log level > 3
+			fmt.Fprintf(os.Stderr, "skipping test %q because it doesn't match test pattern %s\n", test.name, host.m.pattern)
+		}
+		return nil
+	}
+
 	// Register test on simulation server and initialize the T.
 	t := &T{
 		Sim:     host,
-		SuiteID: s,
+		SuiteID: test.suiteID,
+		suite:   test.suite,
 	}
-	testID, err := host.StartTest(s, name, desc)
+	testID, err := host.StartTest(test.suiteID, test.request())
 	if err != nil {
 		return err
 	}
@@ -243,7 +375,7 @@ func runTest(host *Simulation, s SuiteID, name, desc string, runit func(t *T)) e
 	defer func() {
 		t.mu.Lock()
 		defer t.mu.Unlock()
-		host.EndTest(s, testID, t.result)
+		host.EndTest(test.suiteID, testID, t.result)
 	}()
 
 	// Run the test function.
@@ -258,13 +390,17 @@ func runTest(host *Simulation, s SuiteID, name, desc string, runit func(t *T)) e
 			}
 			close(done)
 		}()
+		if host.CollectTestsOnly() && !test.alwaysRun {
+			// Don't run the test if we're just generating docs.
+			return
+		}
 		runit(t)
 	}()
 	<-done
 	return nil
 }
 
-func (spec ClientTestSpec) runTest(host *Simulation, suite SuiteID) error {
+func (spec ClientTestSpec) runTest(host *Simulation, suiteID SuiteID, suite *Suite) error {
 	clients, err := host.ClientTypes()
 	if err != nil {
 		return err
@@ -275,8 +411,16 @@ func (spec ClientTestSpec) runTest(host *Simulation, suite SuiteID) error {
 		if spec.Role != "" && !clientDef.HasRole(spec.Role) {
 			continue
 		}
-		name := clientTestName(spec.Name, clientDef.Name)
-		err := runTest(host, suite, name, spec.Description, func(t *T) {
+		test := testSpec{
+			suiteID:     suiteID,
+			suite:       suite,
+			name:        clientTestName(spec.Name, clientDef.Name),
+			displayName: spec.DisplayName,
+			category:    spec.Category,
+			desc:        spec.Description,
+			alwaysRun:   spec.AlwaysRun,
+		}
+		err := runTest(host, test, func(t *T) {
 			client := t.StartClient(clientDef.Name, spec.Parameters, WithStaticFiles(spec.Files))
 			spec.Run(t, client)
 		})
@@ -298,6 +442,15 @@ func clientTestName(name, clientType string) string {
 	return name + " (" + clientType + ")"
 }
 
-func (spec TestSpec) runTest(host *Simulation, suite SuiteID) error {
-	return runTest(host, suite, spec.Name, spec.Description, spec.Run)
+func (spec TestSpec) runTest(host *Simulation, suiteID SuiteID, suite *Suite) error {
+	test := testSpec{
+		suiteID:     suiteID,
+		suite:       suite,
+		name:        spec.Name,
+		displayName: spec.DisplayName,
+		category:    spec.Category,
+		desc:        spec.Description,
+		alwaysRun:   spec.AlwaysRun,
+	}
+	return runTest(host, test, spec.Run)
 }
